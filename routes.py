@@ -7,6 +7,7 @@ from models import *
 from datetime import datetime
 import jwt
 import os
+import json
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 # Session-based Authentication Decorator
@@ -92,22 +93,64 @@ def register():
     db.session.add(new_user)
     db.session.commit()
     return jsonify({'message': 'User created successfully!'}), 201
+
+
+
+#  add a patient dashboard route:
+@auth_bp.route('/patient-dashboard')
+@session_required
+def patient_dashboard(current_user):
+    if current_user.Role != UserRole.Patient and current_user.Role.value != 'Patient':
+        return jsonify({'message': 'Access denied'}), 403
+    
+    # Get patient data
+    patient = Patients.query.filter_by(Email=current_user.Email).first()
+    if not patient:
+        return jsonify({'message': 'Patient record not found'}), 404
+    
+    return jsonify({
+        'patient': patient.as_dict(),
+        'message': 'Patient dashboard data retrieved successfully'
+    })    
+#______________________________________________________________
 # Patients Routes
 @patients_bp.route('/', methods=['GET'])
 def get_patients():
     patients = Patients.query.all()
+    doctors = Doctors.query.all()  # Get all doctors for the dropdown
+    
+    # Get supplies, medicines, and lab tests for doctor orders
+    supplies = Supplies.query.all()
+    medicines = Pharmacy.query.all()
+    lab_tests = Laboratory.query.all()
+    # Add this line to fetch radiology tests
+    radiology_tests = Radiology.query.all()
     
     # For API requests, return JSON
     if request.headers.get('Accept') == 'application/json':
         return jsonify([p.as_dict() for p in patients])
     
     # For web requests, render template
-    return render_template('patients.html', patients=patients)
+    return render_template('patients.html', 
+                          patients=patients, 
+                          doctors=doctors, 
+                          supplies=supplies,
+                          medicines=medicines,
+                          lab_tests=lab_tests,
+                          radiology_tests=radiology_tests)
 
 @patients_bp.route('/<int:patient_id>', methods=['GET'])
 def get_patient(patient_id):
     patient = Patients.query.get_or_404(patient_id)
-    return jsonify(patient.as_dict())
+    patient_dict = patient.as_dict()
+    
+    # If there's a doctor assigned, get the doctor's name
+    if patient.Doctor:
+        doctor = Doctors.query.get(patient.Doctor)
+        if doctor:
+            patient_dict['DoctorName'] = doctor.Name
+    
+    return jsonify(patient_dict)
 
 @patients_bp.route('/create', methods=['POST'])
 def create_patient():
@@ -128,8 +171,29 @@ def create_patient():
             Diagnose=request.form.get('Diagnose'),
             MedicalNotes=request.form.get('MedicalNotes'),
             Report=request.form.get('Report'),
-            DoctorOrders=request.form.get('DoctorOrders')
+            BloodType=request.form.get('BloodType'),
+            Doctor=request.form.get('Doctor')
         )
+        
+        # Handle doctor orders
+        selected_supplies = request.form.get('selectedSupplies')
+        selected_medicines = request.form.get('selectedMedicines')
+        selected_lab_tests = request.form.get('selectedLabTests')
+        
+        # Combine all doctor orders into a single JSON object
+        doctor_orders = {
+            'supplies': json.loads(selected_supplies) if selected_supplies else [],
+            'medicines': json.loads(selected_medicines) if selected_medicines else [],
+            'labTests': json.loads(selected_lab_tests) if selected_lab_tests else [],
+            # Add this line to include radiology tests
+            'radiologyTests': json.loads(selected_radiology_tests) if selected_radiology_tests else [],
+            'dosageInstructions': request.form.get('medicineDosageInstructions', ''),
+            'labTestNotes': request.form.get('labtestNotes', ''),
+            # Add this line to include radiology notes
+            'radiologyNotes': request.form.get('radiologyNotes', '')
+        }
+        
+        new_patient.DoctorOrders = json.dumps(doctor_orders)
         
         db.session.add(new_patient)
         db.session.commit()
@@ -158,7 +222,30 @@ def update_patient(patient_id):
         patient.Diagnose = request.form.get('Diagnose')
         patient.MedicalNotes = request.form.get('MedicalNotes')
         patient.Report = request.form.get('Report')
-        patient.DoctorOrders = request.form.get('DoctorOrders')
+        patient.BloodType = request.form.get('BloodType')
+        patient.Doctor = request.form.get('Doctor')
+        
+        # Handle doctor orders
+        selected_supplies = request.form.get('selectedSupplies')
+        selected_medicines = request.form.get('selectedMedicines')
+        selected_lab_tests = request.form.get('selectedLabTests')
+        # Add this line to get selected radiology tests
+        selected_radiology_tests = request.form.get('selectedRadiologyTests')
+        
+        # Combine all doctor orders into a single JSON object
+        doctor_orders = {
+            'supplies': json.loads(selected_supplies) if selected_supplies else [],
+            'medicines': json.loads(selected_medicines) if selected_medicines else [],
+            'labTests': json.loads(selected_lab_tests) if selected_lab_tests else [],
+            # Add this line to include radiology tests
+            'radiologyTests': json.loads(selected_radiology_tests) if selected_radiology_tests else [],
+            'dosageInstructions': request.form.get('medicineDosageInstructions', ''),
+            'labTestNotes': request.form.get('labtestNotes', ''),
+            # Add this line to include radiology notes
+            'radiologyNotes': request.form.get('radiologyNotes', '')
+        }
+        
+        patient.DoctorOrders = json.dumps(doctor_orders)
         
         db.session.commit()
         flash('Patient updated successfully!', 'success')

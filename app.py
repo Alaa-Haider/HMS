@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, ses
 # Remove this line:
 # from flask_wtf.csrf import CSRFProtect
 import os
+import json 
 from datetime import datetime
 from dotenv import load_dotenv
 from extensions import db, init_extensions
@@ -10,29 +11,27 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from models import UserRole
 from flask_migrate import Migrate
+from config import config
 
-# Load environment variables
-load_dotenv()
+# Initialize Flask ap
+def create_app(config_name='default'):
+    app = Flask(__name__, 
+                static_folder='static',
+                template_folder='templates')
 
-# Initialize Flask app
-app = Flask(__name__, 
-            static_folder='static',
-            template_folder='templates')
+# Load configuration
+    app.config.from_object(config[config_name])
+    
+    # Initialize Extensions
+    init_extensions(app)
+    
+    # Initialize Flask-Migrate
+    migrate = Migrate(app, db)
+    
+    return app
 
+app = create_app(os.environ.get('FLASK_ENV', 'default'))
 
-# Database Configuration
-db_user = os.environ.get('DB_USER', 'root')
-db_password = os.environ.get('DB_PASSWORD', 'alaa')
-db_host = os.environ.get('DB_HOST', 'localhost')
-db_name = os.environ.get('DB_NAME', 'hospital_db')
-app.config['SQLALCHEMY_DATABASE_URI'] = f"mysql+pymysql://{db_user}:{db_password}@{db_host}/{db_name}"
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev_key_for_development')
-
-# Initialize Extensions
-init_extensions(app)
-# Initialize Flask-Migrate
-migrate = Migrate(app, db)
 # Role-based access control decorator
 def role_required(*roles):
     def decorator(f):
@@ -81,6 +80,7 @@ with app.app_context():
     db.create_all()
 
 # Routes
+# Update the index route to handle the Patient role
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -100,9 +100,73 @@ def index():
         elif role == 'Pharmacist':
             return redirect(url_for('pharmacy_dashboard'))
         elif role == 'Admin':
-            return redirect(url_for('supplies_dashboard'))
+            return redirect(url_for('supplies_dashboard'))     
+        elif role == 'Patient':
+            return redirect(url_for('patient_dashboard'))
     return render_template('index.html')
 
+# Add a patient dashboard route
+@app.route('/patient/dashboard')
+@role_required('Patient')
+def patient_dashboard():
+    # Get the current user's patient record
+    user_id = session.get('user_id')
+    user = Users.query.get(user_id)
+    
+    # Find the patient record associated with this user
+    patient = Patients.query.filter_by(Email=user.Email).first()
+    
+    if not patient:
+        flash('Patient record not found', 'danger')
+        return redirect(url_for('index'))
+    
+    # Get appointments for this patient
+    appointments = Appointments.query.filter_by(PatientID=patient.PatientID).all()
+    
+    # Calculate time remaining for each appointment
+    now = datetime.now()
+    current_date = now.strftime('%Y-%m-%d %H:%M')
+    
+    for appointment in appointments:
+        if appointment.AppointmentDate and appointment.AppointmentDate > now:
+            # Calculate time difference
+            time_diff = appointment.AppointmentDate - now
+            
+            # Format the time difference
+            days = time_diff.days
+            hours, remainder = divmod(time_diff.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            if days > 0:
+                appointment.time_remaining = f"{days} days, {hours} hours"
+            elif hours > 0:
+                appointment.time_remaining = f"{hours} hours, {minutes} minutes"
+            else:
+                appointment.time_remaining = f"{minutes} minutes"
+                
+            # Update status based on time remaining
+            if days > 0:
+                appointment.Status = "Upcoming"
+            elif hours > 0:
+                appointment.Status = "Soon"
+            else:
+                appointment.Status = "Imminent"
+        elif appointment.AppointmentDate and appointment.AppointmentDate <= now:
+            appointment.time_remaining = "Passed"
+            appointment.Status = "Completed"
+        else:
+            appointment.time_remaining = "Unknown"
+    
+    # If patient.Report is None, set it to an empty string to avoid template errors
+    if patient.Report is None:
+        patient.Report = ""
+    
+    return render_template('patient_dashboard.html', 
+                          patient=patient, 
+                          appointments=appointments,
+                          current_date=current_date)
+
+# Update the login route to handle the Patient role
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -139,8 +203,8 @@ def login():
                 return redirect(url_for('radiology_dashboard'))
             elif session['user_role'] == 'Pharmacist':
                 return redirect(url_for('pharmacy_dashboard'))
-            elif session['user_role'] == ' Admin':
-                return redirect(url_for('supplies_dashboard'))
+            elif session['user_role'] == 'Patient':
+                return redirect(url_for('patient_dashboard'))
             else:
                 return redirect(url_for('index'))
         else:
@@ -467,7 +531,56 @@ def delete_medicine(id):
     db.session.commit()
     flash('Medicine deleted successfully', 'success')
     return redirect(url_for('get_pharmacy'))
-
+# Add route for viewing patients with a specific medicine
+@app.route('/pharmacy/medicines/<int:medicine_id>/patients')
+@role_required('Admin', 'Doctor', 'Pharmacist')
+def view_medicine_patients(medicine_id):
+    # Get the medicine details
+    medicine = Pharmacy.query.get_or_404(medicine_id)
+    
+    # Find all patients who have this medicine in their doctor orders
+    patients_with_medicine = []
+    all_patients = Patients.query.all()
+    
+    for patient in all_patients:
+        if patient.DoctorOrders:
+            try:
+                orders = json.loads(patient.DoctorOrders)
+                if 'medications' in orders and orders['medications']:
+                    # Check if this medicine is in the patient's medications
+                    for medication in orders['medications']:
+                        if str(medication.get('id')) == str(medicine_id):
+                            # Get doctor name
+                            doctor_name = "N/A"
+                            if patient.Doctor:
+                                doctor = Doctors.query.get(patient.Doctor)
+                                if doctor:
+                                    doctor_name = doctor.Name
+                            
+                            # Get prescription date (using admission date as an approximation)
+                            prescription_date = patient.Date_admission
+                            if prescription_date:
+                                prescription_date = prescription_date.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                prescription_date = "N/A"
+                            
+                            # Add patient to the list with additional info
+                            patient_info = {
+                                'PatientID': patient.PatientID,
+                                'Name': patient.Name,
+                                'Gender': patient.Gender,
+                                'Age': patient.Age,
+                                'DoctorName': doctor_name,
+                                'PrescriptionDate': prescription_date
+                            }
+                            patients_with_medicine.append(patient_info)
+                            break
+            except json.JSONDecodeError:
+                # Skip patients with invalid JSON in DoctorOrders
+                continue
+    
+    return render_template('medicine_patients.html', medicine=medicine, patients=patients_with_medicine)    
+#_________________________________________________________
 # Similar routes for Laboratory, Radiology, and Supplies
 # Laboratory routes
 @app.route('/laboratory')
@@ -475,12 +588,64 @@ def delete_medicine(id):
 def get_laboratory():
     lab_tests = Laboratory.query.all()
     return render_template('laboratory.html', lab_tests=lab_tests)
+@app.route('/laboratory/tests/<int:test_id>/patients')
+@role_required('Admin', 'Doctor', 'Chemist')
+def view_test_patients(test_id):
+    # Get the test details
+    test = Laboratory.query.get_or_404(test_id)
+    
+    # Find all patients who have this test in their doctor orders
+    patients_with_test = []
+    all_patients = Patients.query.all()
+    
+    for patient in all_patients:
+        if patient.DoctorOrders:
+            try:
+                orders = json.loads(patient.DoctorOrders)
+                if 'labTests' in orders and orders['labTests']:
+                    # Check if this test is in the patient's lab tests
+                    for lab_test in orders['labTests']:
+                        if str(lab_test.get('id')) == str(test_id):
+                            # Get doctor name
+                            doctor_name = "N/A"
+                            if patient.Doctor:
+                                doctor = Doctors.query.get(patient.Doctor)
+                                if doctor:
+                                    doctor_name = doctor.Name
+                            
+                            # Get test date (using admission date as an approximation)
+                            test_date = patient.Date_admission
+                            if test_date:
+                                test_date = test_date.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                test_date = "N/A"
+                            
+                            # Add patient to the list with additional info
+                            patient_info = {
+                                'PatientID': patient.PatientID,
+                                'Name': patient.Name,
+                                'Gender': patient.Gender,
+                                'Age': patient.Age,
+                                'DoctorName': doctor_name,
+                                'TestDate': test_date
+                            }
+                            patients_with_test.append(patient_info)
+                            break
+            except json.JSONDecodeError:
+                # Skip patients with invalid JSON in DoctorOrders
+                continue
+    
+    return render_template('test_patients.html', test=test, patients=patients_with_test)
 
+
+
+#___________________________________________________
 # Radiology routes
 @app.route('/radiology')
 @role_required('Admin', 'Receptionist', 'Radiologist')
-def radiology_page():
-    return redirect(url_for('radiology.get_radiology_tests'))
+def get_radiology():
+    rad_tests = Radiology.query.all()
+    return render_template('radiology.html', rad_tests=rad_tests)
 
 # Add API endpoint for radiology tests
 @app.route('/api/radiology/')
@@ -495,6 +660,62 @@ def api_get_radiology():
             'Price': float(test.Price) if test.Price else 0
         })
     return jsonify(result)
+
+# Add route for viewing patients with a specific radiology test
+@app.route('/radiology/tests/<int:test_id>/patients')
+@role_required('Admin', 'Doctor', 'Radiologist')
+def view_radiology_patients(test_id):
+    # Get the test details
+    test = Radiology.query.get_or_404(test_id)
+    
+    # Find all patients who have this test in their doctor orders
+    patients_with_test = []
+    all_patients = Patients.query.all()
+    
+    for patient in all_patients:
+        if patient.DoctorOrders:
+            try:
+                orders = json.loads(patient.DoctorOrders)
+                if 'radiologyTests' in orders and orders['radiologyTests']:
+                    # Check if this test is in the patient's radiology tests
+                    for rad_test in orders['radiologyTests']:
+                        if str(rad_test.get('id')) == str(test_id):
+                            # Get doctor name
+                            doctor_name = "N/A"
+                            if patient.Doctor:
+                                doctor = Doctors.query.get(patient.Doctor)
+                                if doctor:
+                                    doctor_name = doctor.Name
+                            
+                            # Get test date (using admission date as an approximation)
+                            test_date = patient.Date_admission
+                            if test_date:
+                                test_date = test_date.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                test_date = "N/A"
+                            
+                            # Add patient to the list with additional info
+                            patient_info = {
+                                'PatientID': patient.PatientID,
+                                'Name': patient.Name,
+                                'Gender': patient.Gender,
+                                'Age': patient.Age,
+                                'DoctorName': doctor_name,
+                                'TestDate': test_date
+                            }
+                            patients_with_test.append(patient_info)
+                            break
+            except json.JSONDecodeError:
+                # Skip patients with invalid JSON in DoctorOrders
+                continue
+    
+    return render_template('radiology_patients.html', test=test, patients=patients_with_test)    
+#____________________________________________________
+# Add this API endpoint to get doctor details by ID
+@app.route('/api/doctors/<int:doctor_id>')
+def get_doctor_by_id(doctor_id):
+    doctor = Doctors.query.get_or_404(doctor_id)
+    return jsonify(doctor.as_dict())
 
 # Add route for handling radiology test deletion directly
 @app.route('/radiology/delete/<int:test_id>', methods=['POST'])
@@ -572,6 +793,56 @@ def delete_supply(id):
     flash('Supply deleted successfully', 'success')
     return redirect(url_for('get_supplies'))
 
+# Add route for viewing patients with a specific supply
+@app.route('/supplies/<int:supply_id>/patients')
+@role_required('Admin', 'Doctor', 'Nurse')
+def view_supply_patients(supply_id):
+    # Get the supply details
+    supply = Supplies.query.get_or_404(supply_id)
+    
+    # Find all patients who have this supply in their doctor orders
+    patients_with_supply = []
+    all_patients = Patients.query.all()
+    
+    for patient in all_patients:
+        if patient.DoctorOrders:
+            try:
+                orders = json.loads(patient.DoctorOrders)
+                if 'supplies' in orders and orders['supplies']:
+                    # Check if this supply is in the patient's supplies
+                    for item in orders['supplies']:
+                        if str(item.get('id')) == str(supply_id):
+                            # Get doctor name
+                            doctor_name = "N/A"
+                            if patient.Doctor:
+                                doctor = Doctors.query.get(patient.Doctor)
+                                if doctor:
+                                    doctor_name = doctor.Name
+                            
+                            # Get order date (using admission date as an approximation)
+                            order_date = patient.Date_admission
+                            if order_date:
+                                order_date = order_date.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                order_date = "N/A"
+                            
+                            # Add patient to the list with additional info
+                            patient_info = {
+                                'PatientID': patient.PatientID,
+                                'Name': patient.Name,
+                                'Gender': patient.Gender,
+                                'Age': patient.Age,
+                                'DoctorName': doctor_name,
+                                'OrderDate': order_date
+                            }
+                            patients_with_supply.append(patient_info)
+                            break
+            except json.JSONDecodeError:
+                # Skip patients with invalid JSON in DoctorOrders
+                continue
+    
+    return render_template('supply_patients.html', supply=supply, patients=patients_with_supply)    
+#_________________________________________
 @app.route('/users/view/<int:id>')
 @role_required('Admin')
 def view_user(id):
@@ -714,6 +985,23 @@ def delete_doctor_web(doctor_id):
         flash(f'Error deleting doctor: {str(e)}', 'danger')
     
     return redirect(url_for('doctors.get_doctors'))
+#_____________________________________________________________________
+@app.route('/departments/<int:department_id>/doctors')
+@role_required('Admin', 'Receptionist')
+def view_doctors_by_department(department_id):
+    department = Departments.query.get_or_404(department_id)
+    doctors = Doctors.query.filter_by(DepartmentID=department_id).all()
+    return render_template('doctors_by_department.html', department=department, doctors=doctors)
+
+@app.route('/doctors/view/<int:doctor_id>')
+@role_required('Admin', 'Receptionist', 'Doctor')
+def view_doctor(doctor_id):
+    doctor = Doctors.query.get_or_404(doctor_id)
+    appointments = Appointments.query.filter_by(DoctorID=doctor_id).all()
+    return render_template('doctor_details.html', doctor=doctor, appointments=appointments)
+
+
+
 
 if __name__ == '__main__':
     app.run(debug=True)
